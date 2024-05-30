@@ -1,0 +1,802 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-05-06"
+---
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(dplyr)
+library(mgcv)
+library(pROC)
+```
+
+```{r}
+gossis_1_eicu_only_model_ready <- read_csv("data/gossis-1-eicu-only-model-ready.csv")
+```
+
+### get race from training data
+
+```{r}
+gossis_1_eicu_only <- read_csv("data/gossis-1-eicu-only.csv")
+
+gossis_columns = gossis_1_eicu_only %>% select(patientunitstayid, encounter_id, ethnicity, hospital_bed_size, gender, hospital_id) 
+
+gossis_total = left_join(gossis_1_eicu_only_model_ready, gossis_columns)
+
+### adding prediction column
+
+gossis_1_predictions <- read_csv("data/gossis-1-eicu-predictions.csv")
+
+gossis_total2 = left_join(gossis_total, gossis_1_predictions)
+
+breaks <- quantile(gossis_total2$age, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Create the age groups
+gossis_total2$Age_Group <- cut(gossis_total2$age,
+                    breaks = breaks,
+                    labels = c("Young", "Middle", "Senior"),
+                    include.lowest = TRUE)
+
+gossis_total2 <- gossis_total2 %>%
+  mutate(Age_Group_2 = cut(age,
+                         breaks = c(-Inf, 45, 65, Inf),
+                         labels = c("Young", "Middle", "Senior"),
+                         right = FALSE))
+
+gossis_total_utiltiy2 = gossis_total2 %>% 
+                        mutate(
+                          hospital_bed_size = ifelse(is.na(hospital_bed_size), "NOT_ANSWERED", hospital_bed_size),
+                          subgroup = ifelse(
+                            ethnicity == "African American" &
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+
+                            Age_Group_2 == "Senior" &
+                            hospital_bed_size %in% c("250 - 499", ">= 500"
+                                                     ), "A",
+                            ifelse(
+                            ethnicity == "Caucasian" & 
+                            Age_Group_2 == "Middle" &
+                            hospital_bed_size %in% c("100 - 249", "250 - 499", ">= 500"
+                                                     )
+                            , "C",
+                            ifelse(
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+                            hospital_bed_size %in% c("<100", "100 - 249"
+                                                     ) &
+                            #ethnicity == "African American" & 
+                            Age_Group_2 == "Young", "B", NA)))) %>% filter(subgroup %in% c("A", "B", "C"))
+
+
+gossis_total2 %>%
+                  group_by(ethnicity, Age_Group_2, hospital_bed_size) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy2 %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy2_test = gossis_total_utiltiy2 %>% filter(partition == "testing")
+
+gossis_total2 %>% filter(partition == "testing") %>% summarize(mean(hospital_death)) %>% view()
+
+gossis_total_utiltiy2_test %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+```
+
+
+
+
+### New cost calculation
+
+```{r}
+library(dplyr)
+library(purrr)
+
+calculate_metrics_for_cost_combinations <- function(data, col_pred, col_label, tau_max, col_group = NULL, baseline_cost = 1) {
+  # Generate weights for each threshold (tau)
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds
+  weights_fp <- tau / (1 - tau)
+  
+  calc_group_metrics <- function(df, group_level) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+    
+    calc_metrics <- function(threshold, weight_fp) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+      
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+      
+      expected_cost <- (fn + (fp * weight_fp)) * baseline_cost / total_samples
+      
+      c(TPR = tp / (tp + fn), FPR = fp / (fp + tn), expected_cost = expected_cost)
+    }
+    
+    # Use Map to apply calc_metrics to each pair of (tau, weights_fp)
+    metrics_list <- Map(calc_metrics, tau, weights_fp)
+    metrics_df <- do.call(rbind, metrics_list)
+    metrics_df <- as.data.frame(metrics_df)
+    colnames(metrics_df) <- c("TPR", "FPR", "expected_cost")
+    metrics_df$threshold <- tau
+    metrics_df$group <- group_level
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+    metrics_df$weight_fp <- weights_fp
+
+    return(metrics_df)
+  }
+  
+  if (is.null(col_group)) {
+    all_results <- calc_group_metrics(data, "All")
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    all_results <- do.call(rbind, lapply(grouped_data, calc_group_metrics, "Group"))
+    all_results$group <- rep(names(grouped_data), each = length(tau))
+  }
+  
+  return(all_results)
+}
+
+group_cost_nb_new = calculate_metrics_for_cost_combinations(gossis_total_utiltiy2_test, "gossis1_ihm_pred", "hospital_death", 0.9, "subgroup")
+
+group_cost_nb_new$weight_fp_round = round(group_cost_nb_new$weight_fp, digits = 4)
+```
+
+
+### Calculating total cost /nb for total pop and groups
+```{r}
+
+calculate_nb_ec_for_comb <- function(data, col_pred, col_label, tau_max, fixed_weight_fp, col_group = NULL, baseline_cost = 1) {
+  # Generate a sequence of thresholds
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds for classification
+
+  calc_group_metrics <- function(df, group_level, fixed_weight_fp) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+
+    calc_metrics <- function(threshold) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+
+      net_benefit <- ((tp/total_samples) - ((fp/total_samples) * fixed_weight_fp))
+      expected_cost <- ((fn + (fp * fixed_weight_fp)) * baseline_cost) / total_samples
+      c(TPR = tp / (tp + fn), FPR = fp / (fp + tn), net_benefit = net_benefit, expected_cost = expected_cost)
+    }
+
+    metrics_list <- lapply(tau, calc_metrics)
+    metrics_df <- do.call(rbind, metrics_list)
+    metrics_df <- as.data.frame(metrics_df)
+    colnames(metrics_df) <- c("TPR", "FPR", "net_benefit", "expected_cost")
+    metrics_df$threshold <- tau
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+    metrics_df$weight_fp <- fixed_weight_fp
+    metrics_df$group <- group_level  # Assign group name for each result row
+
+    return(metrics_df)
+  }
+
+  if (is.null(col_group)) {
+    all_results <- calc_group_metrics(data, "All", fixed_weight_fp)
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    all_results <- do.call(rbind, lapply(names(grouped_data), function(group_name) calc_group_metrics(grouped_data[[group_name]], group_name, fixed_weight_fp)))
+  }
+
+  rownames(all_results) <- NULL  # Remove rownames
+  return(all_results)
+}
+# To run this function over a grid of fixed weights for false positives
+#weights_fp_grid <- seq(0.1, 1, length.out = 10)  # Adjust the range and density as needed
+tau <- seq(0.01, 0.9, length.out = 800)  # Thresholds
+weights_fp_grid <- tau / (1 - tau)
+
+total_cost_nb_ec_new <- do.call(rbind, lapply(weights_fp_grid, function(weight_fp) {
+  calculate_nb_for_comb(
+    data = gossis_total_utiltiy2_test, 
+    col_pred = "gossis1_ihm_pred", 
+    col_label = "hospital_death", 
+    tau_max = 0.9, 
+    fixed_weight_fp = weight_fp, 
+    col_group = NULL,  # Optional
+    baseline_cost = 1
+  )
+}))
+
+group_cost_nb_ec_new <- do.call(rbind, lapply(weights_fp_grid, function(weight_fp) {
+  calculate_nb_for_comb(
+    data = gossis_total_utiltiy2_test, 
+    col_pred = "gossis1_ihm_pred", 
+    col_label = "hospital_death", 
+    tau_max = 0.9, 
+    fixed_weight_fp = weight_fp, 
+    col_group = "subgroup",  # Optional
+    baseline_cost = 1
+  )
+}))
+```
+
+
+```{r}
+
+nb_cost_min_thresh_new = group_cost_nb_new %>% select(threshold, weight_fp_round) %>% rename("threshold_nb" = "threshold")
+
+
+optimal_threshold_total_nb_ec_new <- total_cost_nb_ec_new %>%
+  group_by(weight_fp) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    min_expected_cost = min(expected_cost),
+    optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 4),
+         group = "All")
+
+nb_cost_min_thresh_new = nb_cost_min_thresh_new %>% distinct()
+
+
+optimal_threshold_nb_v2_new = left_join(optimal_threshold_total_nb_ec_new, nb_cost_min_thresh_new, by = "weight_fp_round")
+
+optimal_threshold_nb_v2_new$threshold_diff = optimal_threshold_nb_v2_new$optimal_threshold_ec-optimal_threshold_nb_v2_new$threshold_nb
+optimal_threshold_nb_v2_new$group = "All"
+```
+
+
+
+### total_cost optimal threshold
+
+
+```{r}
+nb_cost_min_thresh_new = group_cost_nb_new %>% select(threshold, weight_fp_round) %>% rename("threshold_nb" = "threshold")
+
+group_optimal_threshold_total_nb_ec_new <- group_cost_nb_ec_new %>%
+  group_by(weight_fp, group) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    min_expected_cost = min(expected_cost),
+    optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 4))
+
+nb_cost_min_thresh_new = nb_cost_min_thresh_new %>% distinct()
+
+group_optimal_threshold_total_cost_v2_new = left_join(group_optimal_threshold_total_nb_ec_new, nb_cost_min_thresh_new, by = "weight_fp_round")
+
+group_optimal_threshold_total_cost_v2_new$threshold_diff = group_optimal_threshold_total_cost_v2_new$optimal_threshold_ec-group_optimal_threshold_total_cost_v2_new$threshold_nb
+```
+
+```{r}
+gossis_total_utiltiy2_test$hospital_death_factor = factor(gossis_total_utiltiy2_test$hospital_death)
+
+```
+
+
+### P Tot
+
+
+
+```{r}
+vline1_tot_new <- optimal_threshold_nb_v2_new %>% 
+  filter(group == "All", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = optimal_threshold_ec) %>%
+  pull(xintercept)
+
+vline2_tot_new <- optimal_threshold_nb_v2_new %>% 
+  filter(group == "All", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = threshold_nb) %>%
+  pull(xintercept)
+
+p_tot_new <- ggplot(gossis_total_utiltiy2 %>% filter(
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "GOSSIS Model Predictions",
+       fill = "",
+       title = "Total Sample",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "Density") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 0, l = 5, unit = "pt")
+        ) +    
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_tot_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_tot_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_tot_new, vline2_tot_new), xmax = max(vline1_tot_new, vline2_tot_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3) +
+  geom_curve(aes(x = 0.30, y = 10, xend = vline1_tot_new+0.001, yend = 7), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 10, label = "Cost Minimization Threshold", vjust = -0.5, size = 4) +
+geom_curve(aes(x = 0.30, y = 20, xend = vline2_tot_new+0.001, yend = 17), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 20, label = "Net Benefit Threshold", vjust = -0.5, size = 4)
+
+p_tot_new_v2 <- ggplot(gossis_total_utiltiy2_test %>% filter(
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "GOSSIS Model Predictions",
+       fill = "",
+       title = "Total Sample",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 0, l = 0, unit = "pt"),
+        plot.title = element_text( margin =  margin(t = 0, b = 10, l = 0, unit = "pt")),
+        panel.border = element_rect(fill = NA, color = "black", size = 1)  # Make sure the size is consistent
+
+        ) +    
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_tot_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_tot_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_tot_new, vline2_tot_new), xmax = max(vline1_tot_new, vline2_tot_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3)
+
+
+```
+
+
+### Plotting thresholds
+
+```{r}
+
+vline1_a_new <- group_optimal_threshold_total_cost_v2_new %>% 
+  filter(group == "A", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = optimal_threshold_ec) %>%
+  pull(xintercept)
+
+vline2_a_new <- group_optimal_threshold_total_cost_v2_new %>% 
+  filter(group == "A", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = threshold_nb) %>%
+  pull(xintercept)
+
+p_a_new <- ggplot(gossis_total_utiltiy2_test %>% filter(subgroup == "A",
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "GOSSIS Model Predictions",
+       fill = "",
+       title = "Minority Group (A)",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "Density") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(b = 0, t = 8, l = 5, unit = "pt")
+        ) +  
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.08)) +
+  geom_vline(xintercept = vline1_a_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_a_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_a_new, vline2_a_new), xmax = max(vline1_a_new, vline2_a_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3) +
+  geom_curve(aes(x = 0.30, y = 5, xend = vline1_a_new+0.001, yend = 3), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 5, label = "Cost Minimization Threshold", vjust = -0.5, size = 4) +
+geom_curve(aes(x = 0.30, y = 8, xend = vline2_a_new+0.001, yend = 6), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 8, label = "Net Benefit Threshold", vjust = -0.5, size = 4)
+
+p_a_new_v2 <- ggplot(gossis_total_utiltiy2_test %>% filter(subgroup == "A",
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "",
+       fill = "",
+       title = "Minority Group (A)",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "Density") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 3, b = 2, l = 5, unit = "pt"),
+        plot.title = element_text( margin =  margin(t = 0, b = 10, l = 0, unit = "pt")),
+        panel.border = element_rect(fill = NA, color = "black", size = 1)  # Make sure the size is consistent
+
+        ) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_a_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_a_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_a_new, vline2_a_new), xmax = max(vline1_a_new, vline2_a_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3)
+
+  
+
+```
+
+```{r}
+vline1_b_new <- group_optimal_threshold_total_cost_v2_new %>% 
+  filter(group == "B", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = optimal_threshold_ec) %>%
+  pull(xintercept)
+
+vline2_b_new <- group_optimal_threshold_total_cost_v2_new %>% 
+  filter(group == "B", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = threshold_nb) %>%
+  pull(xintercept)
+  
+p_b_new <- ggplot(gossis_total_utiltiy2_test %>% filter(subgroup == "B",
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "GOSSIS Model Predictions",
+       fill = "",
+       title = "Minority Group (B)",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "Density") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 0, b = 0, l = 5, unit = "pt")
+        ) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_b_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_b_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_b_new, vline2_b_new), xmax = max(vline1_b_new, vline2_b_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3) +
+  geom_curve(aes(x = 0.30, y = 10, xend = vline1_b_new+0.001, yend = 7), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 10, label = "Cost Minimization Threshold", vjust = -0.5, size = 4) +
+geom_curve(aes(x = 0.30, y = 23, xend = vline2_b_new+0.001, yend = 20), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 23, label = "Net Benefit Threshold", vjust = -0.5, size = 4)
+
+p_b_new_v2 <- ggplot(gossis_total_utiltiy2_test %>% filter(subgroup == "B",
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "",
+       fill = "",
+       title = "Minority Group (B)",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 3, b = 2, l = 0, unit = "pt"),
+        plot.title = element_text( margin =  margin(t = 0, b = 10, l = 0, unit = "pt")),
+        panel.border = element_rect(fill = NA, color = "black", size = 1)  # Make sure the size is consistent
+
+        ) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_b_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_b_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_b_new, vline2_b_new), xmax = max(vline1_b_new, vline2_b_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3)
+```
+
+```{r}
+vline1_c_new <- group_optimal_threshold_total_cost_v2_new %>% 
+  filter(group == "C", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = optimal_threshold_ec) %>%
+  pull(xintercept)
+
+vline2_c_new <- group_optimal_threshold_total_cost_v2_new %>% 
+  filter(group == "C", weight_fp_round == 0.1073) %>%
+  summarize(xintercept = threshold_nb) %>%
+  pull(xintercept)
+  
+p_c_new <- ggplot(gossis_total_utiltiy2_test %>% filter(subgroup == "B",
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "GOSSIS Model Predictions",
+       fill = "",
+       title = "Majority Group (C)",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "Density") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 0, b = 0, l = 5, unit = "pt")
+        ) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_c_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_c_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_c_new, vline2_c_new), xmax = max(vline1_c_new, vline2_c_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3) +
+  geom_curve(aes(x = 0.30, y = 10, xend = vline1_c_new+0.001, yend = 7), 
+             arrow = arrow(length = unit(0.01, "npc"), type = "closed"), 
+             color = "black", 
+             curvature = -0.1,
+             linewidth = 0.5) +
+  annotate("text", x = 0.30, y = 10, label = "Cost Minimization Threshold", vjust = -0.5, size = 4) +
+  annotate("text", x = 0.30, y = 23, label = "Net Benefit Threshold", vjust = -0.5, size = 4)
+
+p_c_new_v2 <- ggplot(gossis_total_utiltiy2_test %>% filter(subgroup == "B",
+                                              gossis1_ihm_pred <= 0.27), aes(x = gossis1_ihm_pred, fill = hospital_death_factor)) +
+  geom_density(color = "black", alpha = 0.5) +
+  theme_classic() +
+  labs(x = "GOSSIS Model Predictions",
+       fill = "",
+       title = "Majority Group (C)",
+       #subtitle = "Threshold Selection - Weight 0.1 (1:10)",
+       y = "Density") +
+  scale_fill_manual(values = c("#669bbc", "#9b2226"),
+                    labels = c("Survived", "Died")) +
+  theme(
+        #panel.border = element_rect(fill = NA, color = "black", size = 0.5),  
+        legend.position = "bottom",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=11, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12),
+        axis.title.y =  element_text(colour = "black", size = 12),
+        plot.margin = margin(t = 0, b = 0, l = 5, unit = "pt"),
+        plot.title = element_text( margin =  margin(t = 0, b = 10, l = 0, unit = "pt")),
+        panel.border = element_rect(fill = NA, color = "black", size = 1) 
+        ) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     expand = c(0,0.01)) +
+  scale_y_continuous(expand = c(0, 0.01)) +
+  geom_vline(xintercept = vline1_c_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  geom_vline(xintercept = vline2_c_new, linetype = "dashed", color = "black", show.legend = FALSE) +
+  annotate("rect", xmin = min(vline1_c_new, vline2_c_new), xmax = max(vline1_c_new, vline2_c_new), ymin = -Inf, ymax = Inf, fill = "#bc6c25", alpha = 0.3)
+
+```
+
+```{r}
+p_all_new_v2 = ggpubr::ggarrange(p_a_new_v2, p_b_new_v2,
+                              p_c_new_v2, p_tot_new_v2,
+                          nrow = 2,
+                          ncol = 2,
+                          #widths = c(1,1, 
+                          #           2, 0),
+                          align = "hv",
+                          common.legend = T,
+                          legend = "bottom")
+```
+
+
+
+### Utility calculations
+
+```{r}
+library(dplyr)
+library(caret)
+
+```
+
+
+```{r}
+classify_and_conf_matrix <- function(data, threshold, actual, predicted) {
+  # Classify predictions
+  data$pred_class <- ifelse(data[[predicted]] >= threshold, "1", "0")
+
+  # Compute the confusion matrix
+  confusionMatrix(as.factor(data$pred_class), as.factor(data[[actual]]), positive = "1")
+}
+
+# Assuming 'hospital_death_factor' is the actual outcome variable and 'gossis1_ihm_pred' is the predicted probability
+
+```
+
+```{r}
+
+gossis_total_utiltiy_test$hospital_death_factor = as.factor(gossis_total_utiltiy_test$hospital_death)
+# Filter data for subgroup A and B
+gossis_A <- gossis_total_utiltiy_test %>% filter(subgroup == "A")
+gossis_B <- gossis_total_utiltiy_test %>% filter(subgroup == "B")
+gossis_C <- gossis_total_utiltiy_test %>% filter(subgroup == "C")
+
+# Compute confusion matrices for subgroup A
+conf_matrix_A1 <- classify_and_conf_matrix(gossis_A, vline1_a_new, "hospital_death_factor", "gossis1_ihm_pred")
+conf_matrix_A2 <- classify_and_conf_matrix(gossis_A, vline2_a_new, "hospital_death_factor", "gossis1_ihm_pred")
+
+# Compute confusion matrices for subgroup B
+conf_matrix_B1 <- classify_and_conf_matrix(gossis_B, vline1_b_new, "hospital_death_factor", "gossis1_ihm_pred")
+conf_matrix_B2 <- classify_and_conf_matrix(gossis_B, vline2_b_new, "hospital_death_factor", "gossis1_ihm_pred")
+
+conf_matrix_C1 <- classify_and_conf_matrix(gossis_C, vline1_c_new, "hospital_death_factor", "gossis1_ihm_pred")
+
+conf_matrix_C2 <- classify_and_conf_matrix(gossis_C, vline2_c_new, "hospital_death_factor", "gossis1_ihm_pred")
+
+conf_matrix_d1 <- classify_and_conf_matrix(gossis_total_utiltiy_test, vline1_tot_new, "hospital_death_factor", "gossis1_ihm_pred")
+
+conf_matrix_d2 <- classify_and_conf_matrix(gossis_total_utiltiy_test, vline2_tot_new, "hospital_death_factor", "gossis1_ihm_pred")
+
+# Print out the confusion matrices
+print("Confusion Matrix for Subgroup A at Threshold 1 (vline1_b):")
+print(conf_matrix_A1)
+print("Confusion Matrix for Subgroup A at Threshold 2 (vline2_b):")
+print(conf_matrix_A2)
+
+print("Confusion Matrix for Subgroup B at Threshold 1 (vline1_b):")
+print(conf_matrix_B1)
+print("Confusion Matrix for Subgroup B at Threshold 2 (vline2_b):")
+print(conf_matrix_B2)
+
+```
+
+### For both
+
+```{r}
+classify_and_conf_matrix_tot <- function(data_a, data_b, threshold_a, threshold_b, actual, predicted) {
+  # Classify predictions
+  data_a$pred_class <- ifelse(data_a[[predicted]] >= threshold_a, "1", "0")
+  data_b$pred_class <- ifelse(data_b[[predicted]] >= threshold_b, "1", "0")
+  data = rbind(data_a, data_b)
+  
+  # Compute the confusion matrix
+  confusionMatrix(as.factor(data$pred_class), as.factor(data[[actual]]), positive = "1")
+}
+
+# Assuming 'hospital_death_factor' is the actual outcome variable and 'gossis1_ihm_pred' is the predicted probability
+
+# Filter data for subgroup A and B
+gossis_A <- gossis_total_utiltiy %>% filter(subgroup == "A")
+gossis_B <- gossis_total_utiltiy %>% filter(subgroup == "B")
+
+# Compute confusion matrices for subgroup A
+conf_matrix_tot_min <- classify_and_conf_matrix_tot(gossis_A, gossis_B, 
+                                                vline1_a, vline1_b,
+                                                "hospital_death_factor", "gossis1_ihm_pred")
+
+conf_matrix_tot_nb <- classify_and_conf_matrix_tot(gossis_A, gossis_B, 
+                                                vline2_a, vline2_b,
+                                                "hospital_death_factor", "gossis1_ihm_pred")
+
+conf_matrix_A2 <- classify_and_conf_matrix(gossis_A, vline2_a, "hospital_death_factor", "gossis1_ihm_pred")
+```
+
+
+```{r}
+calculate_metrics <- function(data, threshold, actual, predicted, W) {
+  # Classify predictions
+  data$pred_class <- ifelse(data[[predicted]] >= threshold, "1", "0")
+  
+  # Create a confusion matrix
+  cm <- table(Predicted = as.factor(data$pred_class), Actual = data[[actual]])
+
+  # Retrieve values from the confusion matrix
+  TP <- as.numeric(cm["1", "1"])
+  FP <- as.numeric(cm["1", "0"])
+  FN <- as.numeric(cm["0", "1"])
+  TN <- as.numeric(cm["0", "0"])
+
+  # Calculate total number of cases
+  N <- nrow(data)
+
+  # Compute expected cost
+  expected_cost <- (FN/N) + ((FP/N) * W)
+
+  # Compute net benefit
+  net_benefit <- (TP/N) - ((FP/N) * W)
+
+  # Return a list of metrics
+  list(
+    Expected_Cost = expected_cost,
+    Net_Benefit = net_benefit
+  )
+}
+
+# Assuming vline1_b and vline2_b are computed as previously mentioned
+
+# Apply the function to subgroup A
+metrics_A1 <- calculate_metrics(gossis_A, vline1_a_new, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1073)
+metrics_A2 <- calculate_metrics(gossis_A, vline2_a_new, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1073)
+
+# Apply the function to subgroup B
+metrics_B1 <- calculate_metrics(gossis_B, vline1_b_new, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1073)
+metrics_B2 <- calculate_metrics(gossis_B, vline2_b_new, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1073)
+
+metrics_C1 <- calculate_metrics(gossis_C, vline1_c_new, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1073)
+metrics_C2 <- calculate_metrics(gossis_C, vline2_c_new, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1073)
+
+
+# Print results
+cat("Metrics for Subgroup A at Threshold 1 (vline1_a):\n")
+print(metrics_A1)
+cat("Metrics for Subgroup A at Threshold 2 (vline2_a):\n")
+print(metrics_A2)
+
+cat("Metrics for Subgroup B at Threshold 1 (vline1_b):\n")
+print(metrics_B1)
+cat("Metrics for Subgroup B at Threshold 2 (vline2_b):\n")
+print(metrics_B2)
+
+metrics_tot_1 <- calculate_metrics(gossis_total_utiltiy, vline1_tot, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1)
+metrics_tot_2 <- calculate_metrics(gossis_total_utiltiy, vline2_tot, "hospital_death_factor", "gossis1_ihm_pred", W = 0.1)
+
+
+```
+
+
+
+

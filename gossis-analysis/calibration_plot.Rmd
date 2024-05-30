@@ -1,0 +1,174 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-05-06"
+---
+
+```{r}
+library(tidyverse)
+library(caret)
+library(dplyr)
+library(mgcv)
+library(pROC)
+```
+
+```{r}
+gossis_1_eicu_only_model_ready <- read_csv("data/gossis-1-eicu-only-model-ready.csv")
+```
+
+### get race from training data
+
+```{r}
+gossis_1_eicu_only <- read_csv("data/gossis-1-eicu-only.csv")
+
+gossis_columns = gossis_1_eicu_only %>% select(patientunitstayid, encounter_id, ethnicity, hospital_bed_size, gender, hospital_id) 
+
+gossis_total = left_join(gossis_1_eicu_only_model_ready, gossis_columns)
+
+### adding prediction column
+
+gossis_1_predictions <- read_csv("data/gossis-1-eicu-predictions.csv")
+
+gossis_total2 = left_join(gossis_total, gossis_1_predictions)
+
+breaks <- quantile(gossis_total2$age, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Create the age groups
+gossis_total2$Age_Group <- cut(gossis_total2$age,
+                    breaks = breaks,
+                    labels = c("Young", "Middle", "Senior"),
+                    include.lowest = TRUE)
+
+gossis_total2 <- gossis_total2 %>%
+  mutate(Age_Group_2 = cut(age,
+                         breaks = c(-Inf, 45, 65, Inf),
+                         labels = c("Young", "Middle", "Senior"),
+                         right = FALSE))
+
+gossis_total_utiltiy = gossis_total2 %>% 
+                        mutate(
+                          hospital_bed_size = ifelse(is.na(hospital_bed_size), "NOT_ANSWERED", hospital_bed_size),
+                          subgroup = ifelse(
+                            ethnicity == "African American" &
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+
+                            Age_Group_2 == "Senior" &
+                            hospital_bed_size %in% c("250 - 499", ">= 500"
+                                                     ), "A",
+                            ifelse(
+                            ethnicity == "Caucasian" & 
+                            Age_Group_2 == "Middle" &
+                            hospital_bed_size %in% c("100 - 249", "250 - 499", ">= 500"
+                                                     )
+                            , "C",
+                            ifelse(
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+                            hospital_bed_size %in% c("<100", "100 - 249"
+                                                     ) &
+                            #ethnicity == "African American" & 
+                            Age_Group_2 == "Young", "B", NA)))) %>% filter(subgroup %in% c("A", "B", "C"))
+
+
+
+
+gossis_total2%>% filter(partition == "testing") %>%
+                 filter(Age_Group_2 == "Young" &
+                            hospital_bed_size %in% c("<100", "100 - 249"
+                                                     )) %>% 
+                  group_by(ethnicity, Age_Group_2, hospital_bed_size) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total2%>% filter(partition == "testing") %>%
+                  group_by(ethnicity, Age_Group_2, hospital_bed_size) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total2%>% filter(partition == "testing") %>%
+                  group_by(ethnicity, Age_Group_2) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy_2_test = gossis_total_utiltiy %>% filter(partition == "testing")
+
+gossis_total_utiltiy_2_test %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy_2_test %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+```
+
+```{r}
+# Load required packages
+library(caret)
+library(ggplot2)
+
+# Prepare data (example assuming binary outcome)
+# Make sure to replace `gossis1_ihm_pred` and `hospital_death` with your actual columns
+# Also, remove the summarization step from the previous snippet
+
+# Use the `calibrate` function to get calibration data
+calibration_data_a_list <- calibration(factor(hospital_death, levels = c("1", "0")) ~ gossis1_ihm_pred, data = gossis_total_utiltiy_2_test %>% filter(subgroup == "A"), cuts = 5)
+
+calibration_data_a = calibration_data_a_list$data
+calibration_data_a$subgroup = "A"
+
+calibration_data_b_list <- calibration(factor(hospital_death, levels = c("1", "0")) ~ gossis1_ihm_pred, data = gossis_total_utiltiy_2_test %>% filter(subgroup == "B"), cuts = 5)
+
+calibration_data_b = calibration_data_b_list$data
+calibration_data_b$subgroup = "B"
+
+calibration_data_c_list <- calibration(factor(hospital_death, levels = c("1", "0")) ~ gossis1_ihm_pred, data = gossis_total_utiltiy_2_test %>% filter(subgroup == "C"), cuts = 5)
+
+calibration_data_c = calibration_data_c_list$data
+calibration_data_c$subgroup = "C"
+
+calibration_data_tot_list <- calibration(factor(hospital_death, levels = c("1", "0")) ~ gossis1_ihm_pred, data = gossis_total_utiltiy_2_test, cuts = 5)
+
+calibration_data_tot = calibration_data_tot_list$data
+calibration_data_tot$subgroup = "Tot"
+
+calibration_data_total = rbind(calibration_data_a, calibration_data_b, calibration_data_c, calibration_data_tot)
+
+# Plot calibration data
+p_cal <- ggplot(calibration_data_total, aes(x = midpoint, y = Percent, color = subgroup, fill = subgroup)) +
+  geom_point() +
+  #geom_errorbar(aes(ymin=Lower, ymax=Upper)) + 
+  geom_line() +
+  #geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2) + # Error bands
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +  # Diagonal line
+  scale_color_manual(values = c("A" = "#9b2226", "B" = "#bc6c25",
+                                "C" = "#669bbc", "Tot" = "black"),
+                    labels = c("Minority (A)", "Minority (B)",
+                                "Majority (C)", "Total Population")) +
+  scale_fill_manual(values = c("A" = "#9b2226", "B" = "#bc6c25",
+                                "C" = "#669bbc", "Tot" = "black"),
+                     labels = c("Minority (A)", "Minority (B)",
+                                "Majority (C)", "Total Population")) +
+  labs(title = "",
+       x = "Bin Midpoint",
+       y = "Observed Event Percentage",
+       color = "",
+       fill = "") +
+  theme_classic() +
+  theme(legend.text = element_text(size = 14, color = "black"),
+        legend.position = "top",
+        axis.title.x = element_text(size = 14, color = "black"),
+        axis.title.y = element_text(size = 14, color = "black"),
+        strip.text.x = element_text(size = 14, color = "black"),
+        strip.text.y = element_text(size = 14, color = "black"),
+       plot.margin = margin(t = -10, b = 2, l = 2, unit = "pt"),
+        axis.text.x = element_text(size = 12, color = "black"),
+        axis.text.y = element_text(size = 12, color = "black")) +
+  scale_x_continuous(limits = c(0, 100),
+                     expand = c(0,2)) +
+   scale_y_continuous(limits = c(0, 100),
+                     expand = c(0,2))
+
+```
+
+
+
+

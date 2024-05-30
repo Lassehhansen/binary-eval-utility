@@ -1,0 +1,723 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-05-06"
+---
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(dplyr)
+library(mgcv)
+library(pROC)
+```
+
+```{r}
+gossis_1_eicu_only_model_ready <- read_csv("data/gossis-1-eicu-only-model-ready.csv")
+```
+
+### get race from training data
+
+```{r}
+gossis_1_eicu_only <- read_csv("data/gossis-1-eicu-only.csv")
+
+gossis_columns = gossis_1_eicu_only %>% select(patientunitstayid, encounter_id, ethnicity, hospital_bed_size, gender, hospital_id) 
+
+gossis_total = left_join(gossis_1_eicu_only_model_ready, gossis_columns)
+
+### adding prediction column
+
+gossis_1_predictions <- read_csv("data/gossis-1-eicu-predictions.csv")
+
+gossis_total2 = left_join(gossis_total, gossis_1_predictions)
+
+breaks <- quantile(gossis_total2$age, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Create the age groups
+gossis_total2$Age_Group <- cut(gossis_total2$age,
+                    breaks = breaks,
+                    labels = c("Young", "Middle", "Senior"),
+                    include.lowest = TRUE)
+
+gossis_total2 <- gossis_total2 %>%
+  mutate(Age_Group_2 = cut(age,
+                         breaks = c(-Inf, 45, 65, Inf),
+                         labels = c("Young", "Middle", "Senior"),
+                         right = FALSE))
+
+gossis_total_utiltiy2 = gossis_total2 %>% 
+                        mutate(
+                          hospital_bed_size = ifelse(is.na(hospital_bed_size), "NOT_ANSWERED", hospital_bed_size),
+                          subgroup = ifelse(
+                            ethnicity == "African American" &
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+
+                            Age_Group_2 == "Senior" &
+                            hospital_bed_size %in% c("250 - 499", ">= 500"
+                                                     ), "A",
+                            ifelse(
+                            ethnicity == "Caucasian" & 
+                            Age_Group_2 == "Middle" &
+                            hospital_bed_size %in% c("100 - 249", "250 - 499", ">= 500"
+                                                     )
+                            , "C",
+                            ifelse(
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+                            hospital_bed_size %in% c("<100", "100 - 249"
+                                                     ) &
+                            #ethnicity == "African American" & 
+                            Age_Group_2 == "Young", "B", NA)))) %>% filter(subgroup %in% c("A", "B", "C"))
+
+
+gossis_total2 %>% filter(partition == "testing") %>% 
+                  group_by(ethnicity, Age_Group_2, hospital_bed_size) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy2 %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy2_test = gossis_total_utiltiy2 %>% filter(partition == "testing")
+
+gossis_total_utiltiy2_test %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+gossis_total_utiltiy2_test %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+```
+
+
+
+
+### New cost calculation
+
+```{r}
+library(dplyr)
+library(purrr)
+
+calculate_metrics_for_cost_combinations <- function(data, col_pred, col_label, tau_max, col_group = NULL, baseline_cost = 1) {
+  # Generate weights for each threshold (tau)
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds
+  weights_fp <- tau / (1 - tau)
+  
+  calc_group_metrics <- function(df, group_level) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+    
+    calc_metrics <- function(threshold, weight_fp) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+      
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+      
+      expected_cost <- (fn + (fp * weight_fp)) * baseline_cost / total_samples
+      
+      c(TPR = tp / (tp + fn), FPR = fp / (fp + tn), expected_cost = expected_cost)
+    }
+    
+    # Use Map to apply calc_metrics to each pair of (tau, weights_fp)
+    metrics_list <- Map(calc_metrics, tau, weights_fp)
+    metrics_df <- do.call(rbind, metrics_list)
+    metrics_df <- as.data.frame(metrics_df)
+    colnames(metrics_df) <- c("TPR", "FPR", "expected_cost")
+    metrics_df$threshold <- tau
+    metrics_df$group <- group_level
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+    metrics_df$weight_fp <- weights_fp
+
+    return(metrics_df)
+  }
+  
+  if (is.null(col_group)) {
+    all_results <- calc_group_metrics(data, "All")
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    all_results <- do.call(rbind, lapply(grouped_data, calc_group_metrics, "Group"))
+    all_results$group <- rep(names(grouped_data), each = length(tau))
+  }
+  
+  return(all_results)
+}
+
+group_cost_nb_new = calculate_metrics_for_cost_combinations(gossis_total_utiltiy2_test, "gossis1_ihm_pred", "hospital_death", 0.9, "subgroup")
+
+group_cost_nb_new$weight_fp_round = round(group_cost_nb_new$weight_fp, digits = 2)
+```
+
+
+### Calculating total cost /nb for total pop and groups
+```{r}
+
+calculate_nb_ec_for_comb <- function(data, col_pred, col_label, tau_max, fixed_weight_fp, col_group = NULL, baseline_cost = 1) {
+  # Generate a sequence of thresholds
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds for classification
+
+  calc_group_metrics <- function(df, group_level, fixed_weight_fp) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+
+    calc_metrics <- function(threshold) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+
+      net_benefit <- ((tp/total_samples) - ((fp/total_samples) * fixed_weight_fp))
+      expected_cost <- ((fn + (fp * fixed_weight_fp)) * baseline_cost) / total_samples
+      c(TPR = tp / (tp + fn), FPR = fp / (fp + tn), net_benefit = net_benefit, expected_cost = expected_cost)
+    }
+
+    metrics_list <- lapply(tau, calc_metrics)
+    metrics_df <- do.call(rbind, metrics_list)
+    metrics_df <- as.data.frame(metrics_df)
+    colnames(metrics_df) <- c("TPR", "FPR", "net_benefit", "expected_cost")
+    metrics_df$threshold <- tau
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+    metrics_df$weight_fp <- fixed_weight_fp
+    metrics_df$group <- group_level  # Assign group name for each result row
+
+    return(metrics_df)
+  }
+
+  if (is.null(col_group)) {
+    all_results <- calc_group_metrics(data, "All", fixed_weight_fp)
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    all_results <- do.call(rbind, lapply(names(grouped_data), function(group_name) calc_group_metrics(grouped_data[[group_name]], group_name, fixed_weight_fp)))
+  }
+
+  rownames(all_results) <- NULL  # Remove rownames
+  return(all_results)
+}
+# To run this function over a grid of fixed weights for false positives
+#weights_fp_grid <- seq(0.1, 1, length.out = 10)  # Adjust the range and density as needed
+tau <- seq(0.01, 0.9, length.out = 800)  # Thresholds
+weights_fp_grid <- tau / (1 - tau)
+
+total_cost_nb_ec_new <- do.call(rbind, lapply(weights_fp_grid, function(weight_fp) {
+  calculate_nb_for_comb(
+    data = gossis_total_utiltiy2_test, 
+    col_pred = "gossis1_ihm_pred", 
+    col_label = "hospital_death", 
+    tau_max = 0.9, 
+    fixed_weight_fp = weight_fp, 
+    col_group = NULL,  # Optional
+    baseline_cost = 1
+  )
+}))
+
+group_cost_nb_ec_new <- do.call(rbind, lapply(weights_fp_grid, function(weight_fp) {
+  calculate_nb_for_comb(
+    data = gossis_total_utiltiy2_test, 
+    col_pred = "gossis1_ihm_pred", 
+    col_label = "hospital_death", 
+    tau_max = 0.9, 
+    fixed_weight_fp = weight_fp, 
+    col_group = "subgroup",  # Optional
+    baseline_cost = 1
+  )
+}))
+```
+
+
+```{r}
+
+nb_cost_min_thresh_new = group_cost_nb_new %>% select(threshold, weight_fp) %>% rename("threshold_nb" = "threshold")
+
+
+optimal_threshold_total_nb_ec_new <- total_cost_nb_ec_new %>%
+  group_by(weight_fp) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    min_expected_cost = min(expected_cost),
+    optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 2),
+         group = "All")
+
+nb_cost_min_thresh_new = nb_cost_min_thresh_new %>% distinct()
+
+
+optimal_threshold_nb_v2_new = left_join(optimal_threshold_total_nb_ec_new, nb_cost_min_thresh_new, by = "weight_fp")
+
+optimal_threshold_nb_v2_new$threshold_diff = optimal_threshold_nb_v2_new$optimal_threshold_ec-optimal_threshold_nb_v2_new$threshold_nb
+optimal_threshold_nb_v2_new$group = "All"
+```
+
+
+
+### total_cost optimal threshold
+
+
+```{r}
+nb_cost_min_thresh_new = group_cost_nb_new %>% select(threshold, weight_fp) %>% rename("threshold_nb" = "threshold")
+
+test <- group_cost_nb_ec_new %>%
+  group_by(weight_fp, group) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    #min_expected_cost = min(expected_cost),
+    #optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 2))
+
+
+group_optimal_threshold_total_nb_ec_new <- group_cost_nb_ec_new %>%
+  group_by(weight_fp, group) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    min_expected_cost = min(expected_cost),
+    optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 2))
+
+nb_cost_min_thresh_new = nb_cost_min_thresh_new %>% distinct()
+
+group_optimal_threshold_total_cost_v2_new = left_join(group_optimal_threshold_total_nb_ec_new, nb_cost_min_thresh_new, by = "weight_fp")
+
+group_optimal_threshold_total_cost_v2_new$threshold_diff = group_optimal_threshold_total_cost_v2_new$optimal_threshold_ec-group_optimal_threshold_total_cost_v2_new$threshold_nb
+```
+
+### quickly doing EC/NB threshold equivalens
+
+```{r}
+group_optimal_threshold_total_nb_ec_new$ec_nb_max_min_diff = group_optimal_threshold_total_nb_ec_new
+
+plot_equiv = rbind(group_optimal_threshold_total_nb_ec_new, optimal_threshold_total_nb_ec_new)
+
+facet_labels_subgroups <- c(`A` = "AA Seniors (A)
+(Death Rate 14.3%)", 
+                            
+                            `B` = "Young (B)
+(Death Rate 2.2%)", `C` = "Cau Middle-Aged (C)
+(Death Rate 8.2%)", `All` = "Total Population
+(Death Rate 7.9%)")
+
+plot_equiv$group = factor(plot_equiv$group,
+                                      levels = c("A", "B", "C", "All"))
+
+correlations <- plot_equiv %>%
+  group_by(group) %>%
+  summarise(correlation = cor(optimal_threshold_ec, optimal_threshold_nb, use = "complete.obs")) %>%
+  mutate(label = sprintf("Correlation: %.2f", correlation)) 
+
+ggplot(plot_equiv, aes(x = optimal_threshold_ec, y = optimal_threshold_nb, color = group)) +
+  geom_point() +
+  geom_line() +
+   scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "Threshold - NB Maximization",
+    y = "Threshold - EC Minimization") +
+  theme_classic() +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "none",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) 
+  
+
+p_ec_nb_min_max = ggplot(plot_equiv, aes(x = optimal_threshold_ec, y = optimal_threshold_nb, color = group)) +
+  geom_point() +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "Threshold - NB Maximization",
+    y = "Threshold - EC Minimization"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text.y.right = element_text(angle = 0, size = 12, color = "black"),
+    strip.text = element_text(angle = 0, size = 12, color = "black"),
+    strip.background = element_rect(fill = "white", color = "black", size = 1),
+    panel.border = element_rect(fill = NA, color = "black", size = 1),
+    legend.position = "none",
+    legend.text = element_text(colour = "black", size = 12),
+    axis.text.x = element_text(colour = "black", size = 12),
+    axis.text.y = element_text(size=12, colour="black"),
+    axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+    axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+    axis.ticks.x = element_line(color = "black", size = 0.5)
+  ) +
+  facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups))
+
+# Merge the correlation labels into the plot
+p_ec_nb_min_max_v2 = p_ec_nb_min_max+ geom_text(data = correlations, aes(label = label, x = 0.1, y = 0.8), color = "black")
+
+  
+```
+
+
+```{r}
+gossis_total_utiltiy2$hospital_death_factor = factor(gossis_total_utiltiy2$hospital_death)
+
+
+plot_data_difference_new = rbind(group_optimal_threshold_total_cost_v2_new, optimal_threshold_nb_v2_new)
+```
+
+```{r}
+
+plot_data_difference_new$group_fct = as.factor(plot_data_difference_new$group)
+plot_data_difference_new$weight_fp_round = round(plot_data_difference_new$weight_fp, digits = 4)
+plot_data_difference_new$weight_fp_round_fct = as.factor(plot_data_difference_new$weight_fp_round)
+
+facet_labels_subgroups <- c(`A` = "AA Seniors (A)
+(Death Rate 14.3%)", 
+                            
+                            `B` = "Young (B)
+(Death Rate 2.2%)", `C` = "Cau Middle-Aged (C)
+(Death Rate 8.2%)", `All` = "Total Population
+(Death Rate 7.9%)")
+
+plot_data_difference_new$group = factor(plot_data_difference_new$group,
+                                      levels = c("A", "B", "C", "All"))
+
+```
+
+```{r}
+plot_data_difference_new$threshold_diff_100 = plot_data_difference_new$threshold_diff*100
+p_new_both_thresh_diff_v1 <- ggplot(plot_data_difference_new, aes(x = weight_fp_round_fct, y = threshold_diff_100, color = group)) +
+  geom_point(size = 2) +  # Adjust size as needed
+  geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=threshold_diff_100)) +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=20, linetype = "dashed", color = "black") +
+  geom_hline(yintercept=-20, linetype = "dashed", color = "black") +
+
+  theme(
+        strip.text.y.left  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "none",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = -0.5, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups), switch = "y") +
+  #scale_x_discrete(breaks= c("0", "0.05", "0.1", "0.16", "0.22", "0.29", "0.38", "0.47", "0.57", "0.69", "0.83", "1", "1.2", "1.44", "1.75", "2.14", "2.67", "3.4", "4.5", "6.33", "9")) +
+  scale_y_continuous(limits = c(-32, 32), expand = c(0.05, 0.05))
+```
+
+
+
+```{r}
+
+plot_data_difference_new$threshold_diff_100 = plot_data_difference_new$threshold_diff*100
+p_new_both_thresh_diff_v2 <- ggplot(plot_data_difference_new, aes(x = weight_fp_round, y = threshold_diff_100, color = group)) +
+  geom_point(size = 2) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=threshold_diff_100)) +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=20, linetype = "dashed", color = "black") +
+  geom_hline(yintercept=-20, linetype = "dashed", color = "black") +
+
+  theme(
+        strip.text.y.left  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "none",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = -0.5, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups), switch = "y") +
+  #scale_x_discrete(breaks= c("0", "0.05", "0.1", "0.16", "0.22", "0.29", "0.38", "0.47", "0.57", "0.69", "0.83", "1", "1.2", "1.44", "1.75", "2.14", "2.67", "3.4", "4.5", "6.33", "9")) +
+  scale_y_continuous(limits = c(-32, 32), expand = c(0.05, 0.05))
+```
+
+
+```{r}
+plot_data_difference_new$threshold_diff_100 = plot_data_difference_new$threshold_diff*100
+p_new_both_thresh_diff_v3 <- ggplot(plot_data_difference_new %>% filter(weight_fp <= 1), aes(x = weight_fp_round, y = threshold_diff_100, color = group)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=threshold_diff_100)) +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference %"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=-15, linetype="dashed", color = "black") +
+  geom_hline(yintercept=15, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "none",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  scale_y_continuous(limits = c(-30, 30), expand = c(0, 0),
+                     breaks = c(-30, -15, 0, 15, 30),
+                     labels = c("", "-15", "0", "15", "")) +
+  scale_x_continuous(expand = c(0, 0))
+
+```
+
+
+
+```{r}
+p_new_both_thresh_diff_v4 <- ggplot(plot_data_difference_new, aes(x = weight_fp_round, y = threshold_diff_100, color = group)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=threshold_diff_100)) +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=-15, linetype="dashed", color = "black") +
+  geom_hline(yintercept=15, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "none",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  scale_y_continuous(limits = c(-30, 30), expand = c(0, 0),
+                     breaks = c(-30, -15, 0, 15, 30),
+                     labels = c("", "-15", "0", "15", "")) +
+  scale_x_continuous(expand = c(0, 0))
+```
+
+
+
+
+```{r}
+p_new_both_thresh_diff_v5 <- ggplot(plot_data_difference_new%>% filter(weight_fp_round <= 1), aes(x = weight_fp_round, y = threshold_diff_100, color = group)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=threshold_diff_100)) +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=-15, linetype="dashed", color = "black") +
+  geom_hline(yintercept=15, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  #facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  scale_y_continuous(limits = c(-30, 30), expand = c(0, 0),
+                     breaks = c(-30, -15, 0, 15, 30),
+                     labels = c("", "-15", "0", "15", "")) +
+  scale_x_continuous(expand = c(0, 0))
+```
+
+```{r}
+p_new_both_thresh_diff_v6 <- ggplot(plot_data_difference_new%>% filter(weight_fp_round <= 1), aes(x = weight_fp_round, y = min_expected_cost, color = group)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=min_expected_cost)) +
+  #geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  #geom_hline(yintercept=0, color = "black") +
+  #geom_hline(yintercept=-15, linetype="dashed", color = "black") +
+  #geom_hline(yintercept=15, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  #facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  #scale_y_continuous(limits = c(-30, 30), expand = c(0, 0),
+  #                   breaks = c(-30, -15, 0, 15, 30),
+  #                   labels = c("", "-15", "0", "15", "")) +
+  scale_x_continuous(expand = c(0, 0))
+```
+
+```{r}
+p_new_both_thresh_diff_v6_2 <- ggplot(plot_data_difference_new, aes(x = weight_fp_round, y = min_expected_cost, color = group)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=min_expected_cost)) +
+  #geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  #geom_hline(yintercept=0, color = "black") +
+  #geom_hline(yintercept=-15, linetype="dashed", color = "black") +
+  #geom_hline(yintercept=15, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  #facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  #scale_y_continuous(limits = c(-30, 30), expand = c(0, 0),
+  #                   breaks = c(-30, -15, 0, 15, 30),
+  #                   labels = c("", "-15", "0", "15", "")) +
+  scale_x_continuous(expand = c(0, 0))
+```
+
+```{r}
+p_new_both_thresh_diff_v7 <- ggplot(plot_data_difference_new%>% filter(weight_fp_round <= 1), aes(x = weight_fp_round, y = max_nb, color = group)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=min_expected_cost)) +
+  #geom_line() +
+  scale_color_manual(values=c("#9b2226", "black", "#669bbc", "#bc6c25")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  #geom_hline(yintercept=0, color = "black") +
+  #geom_hline(yintercept=-15, linetype="dashed", color = "black") +
+  #geom_hline(yintercept=15, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  #facet_grid(group ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  #scale_y_continuous(limits = c(-30, 30), expand = c(0, 0),
+  #                   breaks = c(-30, -15, 0, 15, 30),
+  #                   labels = c("", "-15", "0", "15", "")) +
+  scale_x_continuous(expand = c(0, 0))
+```
+
+
+
+
+
+
+

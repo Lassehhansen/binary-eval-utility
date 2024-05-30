@@ -1,0 +1,680 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-05-06"
+---
+
+
+```{r}
+library(tidyverse)
+library(caret)
+library(dplyr)
+library(mgcv)
+library(pROC)
+```
+
+```{r}
+gossis_1_eicu_only_model_ready <- read_csv("data/gossis-1-eicu-only-model-ready.csv")
+```
+
+### get race from training data
+
+```{r}
+gossis_1_eicu_only <- read_csv("data/gossis-1-eicu-only.csv")
+
+gossis_columns = gossis_1_eicu_only %>% select(patientunitstayid, encounter_id, ethnicity, hospital_bed_size, gender, hospital_id) 
+
+gossis_total = left_join(gossis_1_eicu_only_model_ready, gossis_columns)
+
+### adding prediction column
+
+gossis_1_predictions <- read_csv("data/gossis-1-eicu-predictions.csv")
+
+gossis_total2 = left_join(gossis_total, gossis_1_predictions)
+
+breaks <- quantile(gossis_total2$age, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Create the age groups
+gossis_total2$Age_Group <- cut(gossis_total2$age,
+                    breaks = breaks,
+                    labels = c("Young", "Middle", "Senior"),
+                    include.lowest = TRUE)
+
+gossis_total2 <- gossis_total2 %>%
+  mutate(Age_Group_2 = cut(age,
+                         breaks = c(-Inf, 45, 65, Inf),
+                         labels = c("Young", "Middle", "Senior"),
+                         right = FALSE))
+
+gossis_total_utiltiy = gossis_total2 %>% 
+                        mutate(
+                          hospital_bed_size = ifelse(is.na(hospital_bed_size), "NOT_ANSWERED", hospital_bed_size),
+                          subgroup = ifelse(
+                            ethnicity == "African American" &
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+
+                            Age_Group_2 == "Senior" &
+                            hospital_bed_size %in% c("250 - 499", ">= 500"
+                                                     ), "A",
+                            ifelse(
+                            ethnicity == "Caucasian" & 
+                            Age_Group_2 == "Middle" &
+                            hospital_bed_size %in% c("100 - 249", "250 - 499", ">= 500"
+                                                     )
+                            , "C",
+                            ifelse(
+                            #ethnicity %in% c("African American", "Hispanic", "Asian", "Native American") & 
+                            hospital_bed_size %in% c("<100", "100 - 249"
+                                                     ) &
+                            #ethnicity == "African American" & 
+                            Age_Group_2 == "Young", "B", NA)))) %>% filter(subgroup %in% c("A", "B", "C"))
+gossis_total_utiltiy %>%
+                  group_by(ethnicity, Age_Group, hospital_bed_size) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+
+gossis_total_utiltiy_test = gossis_total_utiltiy %>% filter(partition == "testing")
+
+gossis_total_utiltiy_test %>%
+                  group_by(subgroup) %>% summarize(mean(hospital_death),
+                                                                                  n()) %>% view()
+```
+
+
+
+### New cost calculation
+
+```{r}
+library(dplyr)
+library(purrr)
+
+calculate_metrics_for_cost_combinations <- function(data, col_pred, col_label, tau_max, col_group = NULL, baseline_cost = 1) {
+  # Generate weights for each threshold (tau)
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds
+  weights_fp <- tau / (1 - tau)
+  
+  calc_group_metrics <- function(df, group_level) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+    
+    calc_metrics <- function(threshold, weight_fp) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+      
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+      
+      expected_cost <- (fn + (fp * weight_fp)) * baseline_cost / total_samples
+      
+      c(TPR = tp / (tp + fn), FPR = fp / (fp + tn), expected_cost = expected_cost)
+    }
+    
+    # Use Map to apply calc_metrics to each pair of (tau, weights_fp)
+    metrics_list <- Map(calc_metrics, tau, weights_fp)
+    metrics_df <- do.call(rbind, metrics_list)
+    metrics_df <- as.data.frame(metrics_df)
+    colnames(metrics_df) <- c("TPR", "FPR", "expected_cost")
+    metrics_df$threshold <- tau
+    metrics_df$group <- group_level
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+    metrics_df$weight_fp <- weights_fp
+
+    return(metrics_df)
+  }
+  
+  if (is.null(col_group)) {
+    all_results <- calc_group_metrics(data, "All")
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    all_results <- do.call(rbind, lapply(grouped_data, calc_group_metrics, "Group"))
+    all_results$group <- rep(names(grouped_data), each = length(tau))
+  }
+  
+  return(all_results)
+}
+
+group_cost_nb = calculate_metrics_for_cost_combinations(gossis_total_utiltiy_test, "gossis1_ihm_pred", "hospital_death", 0.9, "subgroup")
+
+group_cost_nb$weight_fp_round = round(group_cost_nb$weight_fp, digits = 4)
+```
+
+## Net benefit, relative harm, relative benefit
+
+### With groups
+
+```{r}
+library(dplyr)
+library(purrr)
+
+cost_threshold_data <- function(data, col_pred, col_label, tau_max, col_group = NULL) {
+  # Check if column names are provided as strings
+  if (!is.character(col_pred) || !is.character(col_label)) {
+    stop("Column names must be provided as strings in quotation marks.")
+  }
+
+  # Check if the columns exist in the dataframe and are numeric
+  if (!col_pred %in% names(data)) {
+    stop("Prediction column name does not exist in the dataframe.")
+  }
+  if (!is.numeric(data[[col_pred]])) {
+    stop("Prediction column must be numeric.")
+  }
+  if (!col_label %in% names(data)) {
+    stop("Label column name does not exist in the dataframe.")
+  }
+  if (!is.numeric(data[[col_label]])) {
+    stop("Label column must be numeric.")
+  }
+
+  if (!is.null(col_group) && !col_group %in% names(data)) {
+    stop("Grouping column does not exist in the dataframe.")
+  }
+
+  # Replace NA values with "missing" and ensure the group column is a factor
+  if (!is.null(col_group)) {
+    data[[col_group]] <- ifelse(is.na(data[[col_group]]), "Missing", as.character(data[[col_group]]))
+    data[[col_group]] <- factor(data[[col_group]])
+  }
+
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds
+
+  calc_group_metrics <- function(df, group_level) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+
+    calc_metrics <- function(threshold) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+
+      tpr <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+      fpr <- ifelse((fp + tn) > 0, fp / (fp + tn), 0)
+      
+      weight = threshold / (1 - threshold)
+      
+      n = nrow(df)
+
+      relative_harm <- ((fp/n)*weight) + (fn/n)
+      net_benefit <- (tp/n) - ((fp/n)*weight)
+      relative_benefit <- (tp/n)+(tn/n)
+      expected_cost <- ((fn + (fp * weight))) / total_samples
+
+      tp_all_treat <- sum(actual_positive)
+      fp_all_treat <- sum(actual_negative)
+      
+      treat_all = (tp_all_treat/n) - ((fp_all_treat/n)*weight)
+      treat_none = 0
+ 
+      c(TPR = tpr, FPR = fpr, expected_FP = fp, expected_FN = fn, net_benefit = net_benefit, relative_harm = relative_harm, relative_benefit = relative_benefit, n = n, tp = tp, tn = tn, treat_all = treat_all, treat_none = treat_none, expected_cost = expected_cost, weight = weight)
+    }
+
+    metrics_list <- map(tau, calc_metrics)
+    metrics_df <- as.data.frame(do.call(rbind, metrics_list))
+    colnames(metrics_df) <- c("TPR", "FPR", "expected_FP", "expected_FN", "net_benefit", "relative_harm", "relative_benefit", "n", "tp", "tn", "treat_all", "treat_none", "expected_cost", "weight")
+    metrics_df$threshold <- tau
+    metrics_df$group <- group_level
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+
+    return(metrics_df)
+  }
+
+  if (is.null(col_group)) {
+    results <- calc_group_metrics(data, "All")
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    results <- map_df(names(grouped_data), ~calc_group_metrics(grouped_data[[.x]], .x), .id = NULL)
+  }
+
+  return(results)
+}
+
+
+group_cost_nb_v2 = cost_threshold_data(gossis_total_utiltiy_test, "gossis1_ihm_pred", "hospital_death", 0.9, "subgroup")
+group_cost_nb_v2$weight_fp_round = round(group_cost_nb_v2$weight, digits = 4)
+
+total_cost_nb_v2 = cost_threshold_data(gossis_total_utiltiy_test, "gossis1_ihm_pred", "hospital_death", 0.9)
+total_cost_nb_v2$weight_fp_round = round(total_cost_nb_v2$weight, digits = 4)
+
+```
+
+### Calculating total cost /nb for total pop and groups
+```{r}
+
+calculate_nb_ec_for_comb <- function(data, col_pred, col_label, tau_max, fixed_weight_fp, col_group = NULL, baseline_cost = 1) {
+  # Generate a sequence of thresholds
+  tau <- seq(0.01, tau_max, length.out = 800)  # Thresholds
+
+  calc_group_metrics <- function(df, group_level, fixed_weight_fp) {
+    total_samples <- nrow(df)
+    prevalence <- mean(df[[col_label]])
+
+    calc_metrics <- function(threshold) {
+      predicted_positive <- df[[col_pred]] >= threshold
+      predicted_negative <- df[[col_pred]] < threshold
+      actual_positive <- df[[col_label]] == 1
+      actual_negative <- df[[col_label]] == 0
+
+      tp <- sum(predicted_positive & actual_positive)
+      fp <- sum(predicted_positive & actual_negative)
+      fn <- sum(predicted_negative & actual_positive)
+      tn <- sum(predicted_negative & actual_negative)
+
+      net_benefit <- ((tp/total_samples) - ((fp/total_samples) * fixed_weight_fp))
+      expected_cost <- ((fn + (fp * fixed_weight_fp)) * baseline_cost) / total_samples
+      c(TPR = tp / (tp + fn), FPR = fp / (fp + tn), net_benefit = net_benefit, expected_cost = expected_cost)
+    }
+
+    metrics_list <- lapply(tau, calc_metrics)
+    metrics_df <- do.call(rbind, metrics_list)
+    metrics_df <- as.data.frame(metrics_df)
+    colnames(metrics_df) <- c("TPR", "FPR", "net_benefit", "expected_cost")
+    metrics_df$threshold <- tau
+    metrics_df$total_samples <- total_samples
+    metrics_df$prevalence <- prevalence
+    metrics_df$weight_fp <- fixed_weight_fp
+    metrics_df$group <- group_level  # Assign group name for each result row
+
+    return(metrics_df)
+  }
+
+  if (is.null(col_group)) {
+    all_results <- calc_group_metrics(data, "All", fixed_weight_fp)
+  } else {
+    grouped_data <- split(data, data[[col_group]])
+    all_results <- do.call(rbind, lapply(names(grouped_data), function(group_name) calc_group_metrics(grouped_data[[group_name]], group_name, fixed_weight_fp)))
+  }
+
+  rownames(all_results) <- NULL  # Remove rownames
+  return(all_results)
+}
+# To run this function over a grid of fixed weights for false positives
+#weights_fp_grid <- seq(0.1, 1, length.out = 10)  # Adjust the range and density as needed
+tau <- seq(0.01, 0.9, length.out = 800)  # Thresholds
+weights_fp_grid <- tau / (1 - tau)
+
+total_cost_nb_ec <- do.call(rbind, lapply(weights_fp_grid, function(weight_fp) {
+  calculate_nb_for_comb(
+    data = gossis_total_utiltiy_test, 
+    col_pred = "gossis1_ihm_pred", 
+    col_label = "hospital_death", 
+    tau_max = 0.9, 
+    fixed_weight_fp = weight_fp, 
+    col_group = NULL,  # Optional
+    baseline_cost = 1
+  )
+}))
+
+group_cost_nb_ec <- do.call(rbind, lapply(weights_fp_grid, function(weight_fp) {
+  calculate_nb_for_comb(
+    data = gossis_total_utiltiy_test, 
+    col_pred = "gossis1_ihm_pred", 
+    col_label = "hospital_death", 
+    tau_max = 0.9, 
+    fixed_weight_fp = weight_fp, 
+    col_group = "subgroup",  # Optional
+    baseline_cost = 1
+  )
+}))
+```
+
+
+```{r}
+
+nb_cost_min_thresh = group_cost_nb %>% select(threshold, weight_fp_round) %>% rename("threshold_nb" = "threshold")
+
+
+optimal_threshold_total_nb_ec <- total_cost_nb_ec %>%
+  group_by(weight_fp) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    min_expected_cost = min(expected_cost),
+    optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 4),
+         group = "All")
+
+optimal_threshold_total_nb_ec$diff_test = optimal_threshold_total_nb_ec$optimal_threshold_ec -optimal_threshold_total_nb_ec$optimal_threshold_nb
+
+
+# optimal_threshold_nb_v2 = left_join(optimal_threshold_total_nb_ec, nb_cost_min_thresh, by = "weight_fp_round")
+# 
+# optimal_threshold_nb_v2$threshold_diff = optimal_threshold_nb_v2$optimal_threshold_ec-optimal_threshold_nb_v2$threshold_nb
+# optimal_threshold_nb_v2$group = "All"
+```
+
+
+
+### total_cost optimal threshold
+
+
+```{r}
+nb_cost_min_thresh = group_cost_nb %>% select(threshold, weight_fp_round) %>% rename("threshold_nb" = "threshold")
+
+group_optimal_threshold_total_nb_ec <- group_cost_nb_ec %>%
+  group_by(weight_fp, group) %>%
+  summarize(
+    max_nb = max(net_benefit),
+    min_expected_cost = min(expected_cost),
+    optimal_threshold_ec = threshold[which.min(expected_cost)],
+    optimal_threshold_nb = threshold[which.max(net_benefit)],
+    .groups = "drop"
+  ) %>% 
+  mutate(weight_fp_round = round(weight_fp, digits = 4))
+
+# group_optimal_threshold_total_cost_v2 = left_join(group_optimal_threshold_total_nb_ec, nb_cost_min_thresh, by = "weight_fp_round")
+# 
+# group_optimal_threshold_total_cost_v2$threshold_diff = group_optimal_threshold_total_cost_v2$optimal_threshold_ec-group_optimal_threshold_total_cost_v2$threshold_nb
+```
+
+### bind together first NET BENEFIT
+
+#### nb framework
+
+```{r}
+group_cost_ec_v3 =group_cost_nb_v2 %>% select(weight_fp_round, expected_cost, group)
+total_cost_ec_v3 = total_cost_nb_v2 %>% select(weight_fp_round, expected_cost, group)
+
+total_net_benefit_framework_ec = rbind(group_cost_ec_v3, total_cost_ec_v3)
+total_net_benefit_framework_ec$framework = "Net Benefit Framework"
+#total_net_benefit_framework_ec$outcome = "Expected Cost"
+
+group_cost_nb_v3 =group_cost_nb_v2 %>% select(weight_fp_round, net_benefit, group)
+total_cost_nb_v3 = total_cost_nb_v2 %>% select(weight_fp_round, net_benefit, group)
+
+total_net_benefit_framework_nb = rbind(group_cost_nb_v3, total_cost_nb_v3)
+total_net_benefit_framework_nb$framework = "Net Benefit Framework"
+#total_net_benefit_framework_nb$outcome = "Net Benefit"
+
+```
+
+
+
+### Plotting different costs for optimal thresholds
+
+```{r}
+
+together_nb_ec = rbind(group_optimal_threshold_total_nb_ec, optimal_threshold_total_nb_ec)
+                       
+tot_group_cost_ec = together_nb_ec %>%
+  group_by(weight_fp_round, group) %>%
+  summarize(
+    expected_cost = min(min_expected_cost),
+    optimal_threshold = optimal_threshold_ec[which.min(min_expected_cost)]
+  )
+
+tot_group_cost_nb = together_nb_ec %>%
+  group_by(weight_fp_round, group) %>%
+  summarize(
+    max_nb = max(max_nb),
+    optimal_threshold = optimal_threshold_nb[which.max(max_nb)]
+  )
+
+tot_group_cost_ec_v2 = tot_group_cost_ec %>%  select(weight_fp_round, expected_cost, group)
+tot_group_cost_nb_v2 = tot_group_cost_nb %>%  select(weight_fp_round, max_nb, group)
+
+tot_group_cost_ec_v2$framework = "Expected Cost Minimization"
+tot_group_cost_nb_v2$framework = "Expected Cost Minimization"
+
+```
+
+
+### Comparison NET BENEFIT
+
+```{r}
+total_net_benefit_framework_nb_v2 = total_net_benefit_framework_nb %>% rename("net_benefit_nb_framework" = "net_benefit")
+
+total_net_benefit_framework_nb
+tot_group_cost_nb_v3 = tot_group_cost_nb_v2 %>% rename("net_benefit_ec_framework" = "max_nb")
+
+tot_tot_new_nb = left_join(tot_group_cost_nb_v3, total_net_benefit_framework_nb_v2, by = c("weight_fp_round", "group"))
+tot_tot_new_nb$diff = tot_tot_new_nb$net_benefit_ec_framework- tot_tot_new_nb$net_benefit_nb_framework
+
+tot_tot_new_nb$outcome = "Net Benefit"
+
+```
+
+### Comparison EXPECTED COST
+
+```{r}
+total_net_benefit_framework_ec_v2 = total_net_benefit_framework_ec %>% rename("expected_cost_nb_framework" = "expected_cost")
+tot_group_cost_ec_v3 = tot_group_cost_ec_v2 %>% rename("expected_cost_ec_framework" = "expected_cost")
+
+tot_tot_new_ec = left_join(tot_group_cost_ec_v3, total_net_benefit_framework_ec_v2, by = c("weight_fp_round", "group"))
+tot_tot_new_ec$diff = tot_tot_new_ec$expected_cost_ec_framework- tot_tot_new_ec$expected_cost_nb_framework
+
+tot_tot_new_ec$outcome = "Expected Cost"
+```
+
+
+```{r}
+tot_tot_new = rbind(tot_tot_new_ec, tot_tot_new_nb)
+
+tot_tot_new_ec
+```
+
+### Wranling for last plot
+
+```{r}
+tot_tot_new$weight_fp_round_factor = as.factor(tot_tot_new$weight_fp_round)
+
+tot_tot_new$group_factor = as.factor(tot_tot_new$group)
+
+tot_tot_new$weight_relationship = 1/tot_tot_new$weight_fp_round
+tot_tot_new$weight_relationship_round = round(tot_tot_new$weight_relationship, digits = 2)
+
+facet_labels_cost <- c(`25` = "1:25", `20` = "1:20", `10` = "1:10",
+                       `5` = "1:5", `1` = "1:1", `0.75` = "1:0.75",
+                       `1` = "1:0.51", `0.25` = "1:0.25"
+                       )
+
+tot_tot_new$group_factor = factor(tot_tot_new$group,
+                                 levels = c("All",
+                                            "C",
+                                            "B", 
+                                            "A"))
+
+tot_tot_new$weight_relationship = factor(tot_tot_new$weight_relationship,
+                                            levels = c(20, 5, 1, 0.25))
+
+tot_tot_new_v2 = tot_tot_new %>% filter(weight_relationship %in% c(20, 5, 1, 0.25))
+
+tot_tot_new_v2$group_factor = factor(tot_tot_new_v2$group,
+                                 levels = c("All",
+                                            "C",
+                                            "B", 
+                                            "A"))
+
+tot_tot_new_v2$weight_relationship = factor(tot_tot_new_v2$weight_relationship,
+                                            levels = c(20, 5, 1, 0.25))
+```
+
+
+```{r}
+p_new_both <- ggplot(tot_tot_new_v2, aes(x = group_factor, y = diff, fill = outcome)) +
+  geom_point(size = 2) +  # Adjust size as needed
+  #geom_segment(aes(x=group, xend=group, y=0, yend=diff)) +
+
+  geom_bar(stat = "identity", position = "stack", color = "black") +
+  #scale_fill_manual(values=rev(c("#C26A77", "#487872", "#A76144"))) +
+  #scale_fill_manual(values=rev(c("#C26A77", "#487872"))) +
+  #scale_fill_manual(values=c("#a63236", "#5b8ca8")) +
+  scale_fill_manual(values=c("#9b2226", "#669bbc")) +
+
+  labs(
+    x = "",
+    y = "Difference
+(EC/NB Minimization/Maximization - Net Benefit Framework)",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+        strip.text.y  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),  # Make sure the size is consistent
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x =  element_text(colour = "black", size = 12,
+                                    margin = margin(t = 10, b = 4, unit = "pt")),
+        #axis.ticks.y = element_blank(),
+        axis.ticks.x = element_line(color = "black", size = 0.5)
+
+        ) +
+  coord_flip() +
+  facet_grid(weight_relationship ~ ., labeller = labeller(weight_relationship = facet_labels_cost,
+                                                                scales = "free")) +
+  scale_x_discrete(labels=rev(c("Subgroup A", "Subgroup B", "Total Population")))
+```
+
+```{r}
+facet_labels_subgroups <- c(`A` = "AA Seniors (A)
+(Death Rate 14.3%)", 
+                            
+                            `B` = "Young (B)
+(Death Rate 2.2%)", `C` = "Cau Middle-Aged (C)
+(Death Rate 8.2%)", `All` = "Total Population
+(Death Rate 7.9%)")
+tot_tot_new$group = factor(tot_tot_new$group,
+                                      levels = c("A", "B", "C", "All"))
+```
+
+
+
+```{r}
+tot_tot_new$weight_fp_round_fct = as.factor(tot_tot_new$weight_fp_round)
+
+benefit_diff <- ggplot(tot_tot_new, aes(x = weight_fp_round_fct, y = diff, color = outcome)) +
+  geom_point(size = 2) +  # Adjust size as needed
+  geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=diff)) +
+  scale_color_manual(values=c("#9b2226", "#669bbc")) +
+  labs(
+    x = "False Positive Weight",
+    y = expression("Threshold Difference"),
+    color = "",
+    caption = expression("Threshold Difference" == "Threshold (Cost Minimization)" - "Threshold (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, linetype="dashed", color = "black") +
+  #geom_hline(yintercept=-0.2, linetype="dashed", color = "black") +
+  #geom_hline(yintercept=0.2, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.left  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = -1.5, vjust = 1, size = 10, face = "bold", color = "black")  # Customize the caption appearance
+        ) +
+  facet_grid(group_factor ~ ., labeller = labeller(group = facet_labels_subgroups)) +
+  #scale_x_discrete(breaks= c("0", "0.05", "0.1", "0.16", "0.22", "0.29", "0.38", "0.47", "0.57", "0.69", "0.83", "1", "1.2", "1.44", "1.75", "2.14", "2.67", "3.4", "4.5", "6.33", "9")) +
+  scale_y_continuous(expand = c(0,0))
+```
+
+```{r}
+
+tot_tot_new$group_factor = factor(tot_tot_new$group,
+                                      levels = c("A", "B", "C", "All"))
+benefit_diff_cont <- ggplot(tot_tot_new, aes(x = weight_fp_round, y = diff, color = outcome)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=diff)) +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "#669bbc")) +
+  labs(
+    x = "False Positive Weight",
+    y = "EC/NB Difference",
+    color = "",
+    caption = expression("EC/NB Difference" == "EC/NB (Cost Minimization)" - "EC/NB (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=-0.01, linetype="dashed", color = "black") +
+  geom_hline(yintercept=0.01, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  
+        ) +
+  facet_grid(group_factor ~ ., labeller = labeller(group_factor = facet_labels_subgroups)) +
+
+  scale_y_continuous(expand = c(0,0), n.breaks = 4) +
+  scale_x_continuous(expand = c(0,0))
+
+```
+
+```{r}
+benefit_diff_cont_v2 <- ggplot(tot_tot_new %>% filter(weight_fp_round <= 1), aes(x = weight_fp_round, y = diff, color = outcome)) +
+  geom_point(size = 0.5) +  # Adjust size as needed
+  #geom_segment(aes(x=weight_fp_round_fct, xend=weight_fp_round_fct, y=0, yend=diff)) +
+  geom_line() +
+  scale_color_manual(values=c("#9b2226", "#669bbc")) +
+  labs(
+    x = "False Positive Weight",
+    y = "EC/NB Difference",
+    color = "",
+    caption = expression("EC/NB Difference" == "EC/NB (Cost Minimization)" - "EC/NB (Net Benefit)")  # Adding the formula as a caption
+  ) +
+  theme_classic() +
+  geom_hline(yintercept=0, color = "black") +
+  geom_hline(yintercept=-0.005, linetype="dashed", color = "black") +
+  geom_hline(yintercept=0.005, linetype="dashed", color = "black") +
+
+  theme(
+        strip.text.y.right  = element_text(angle = 0, size = 12, color = "black"),
+        strip.text = element_text(angle = 0, size = 12, color = "black"),
+        strip.background = element_rect(fill = "white", color = "black", size = 1),
+        panel.border = element_rect(fill = NA, color = "black", size = 1),
+        legend.position = "top",
+        legend.text = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 11),
+        axis.text.y = element_text(size=12, colour="black"),
+        axis.title.x = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.title.y = element_text(colour = "black", size = 12, margin = margin(t = 10, b = 4, unit = "pt")),
+        axis.ticks.x = element_line(color = "black", size = 0.5),
+        plot.caption = element_text(hjust = 0, vjust = 1, size = 10, face = "bold", color = "black")  
+        ) +
+  facet_grid(group_factor ~ ., labeller = labeller(group_factor = facet_labels_subgroups)) +
+
+  scale_y_continuous(expand = c(0,0),
+                     breaks = c(-0.005, 0.000, 0.005)) +
+  scale_x_continuous(expand = c(0.01,0.01))
+```
+
+
+
+
