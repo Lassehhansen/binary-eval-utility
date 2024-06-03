@@ -42,6 +42,7 @@ The GOSSIS model is trained on more than 300,000 individuals from the US, Austra
 ### Repository Structure for GOSSIS Analysis
 
 - **gossis-analysis**: Contains the analysis of the downstream utility effects of miscalibration on utility downstream.
+- **gossis-figures**: Contains the figures produced from the GOSSIS analysis.
 
 ## Analysis and Findings
 
