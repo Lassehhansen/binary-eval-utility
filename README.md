@@ -4,7 +4,9 @@ This repository contains the code and analysis for the thesis addressing the gap
 
 ![infographic_thesis](https://github.com/Lassehhansen/binary-eval-utility/assets/54820693/ee0332c5-58f2-4302-9f56-d51e80fd9597)
 
-Figure: This infographic illustrates the ML development and deployment evaluation cycle as described in the thesis. The process begins with problem definition and data choice, followed by training and tuning models on split data. Models are evaluated based on discriminative accuracy (AUROC/AUPRC) and calibration. The thesis highlights the gap between model development and deployment, emphasizing downstream utility effects of evaluation choices on clinical utility. In deployment, models chosen based on AUPRC can lower utility for minority subgroups if thresholds are not appropriately set, while calibration issues can lead to lowered utility.
+**Figure**: This infographic illustrates the ML development and deployment evaluation cycle as described in the thesis. The process begins with problem definition and data choice, followed by training and tuning models on split data. Models are evaluated based on discriminative accuracy (AUROC/AUPRC) and calibration. The thesis highlights the gap between model development and deployment, emphasizing downstream utility effects of evaluation choices on clinical utility. In deployment, models chosen based on AUPRC can lower utility for minority subgroups if thresholds are not appropriately set, while calibration issues can lead to lowered utility.
+
+**Thesis Objective**
 
 The thesis that this code is produced for, explores the perceived superiority of the discrimination metric AUPRC under class imbalance by reviewing a large volume of machine learning papers. A large-scale simulation is conducted to show that AUPRC is not universally preferred in such settings and to provide a framework to understand the downstream utility effects of model evaluation metric choices. This involves generating over 800,000 model scores and examining the sensitivity of AUROC and AUPRC to subpopulation shifts. 
 
@@ -16,7 +18,7 @@ A large-scale simulation of more than 800,000 model scores for a binary classifi
 
 To simulate risk scores between 0 and 1, the beta distribution was used due to its flexibility and ability to generate model probabilities. The simulation involved generating 847,800 distinct sets of positive and negative disease distributions along with their corresponding labels for both subpopulations A and B. The parameters for each distribution were determined based on expected values and confidence levels. The simulated probabilities and labels from both subpopulations were combined to form a unified dataset, representing the total population. Each combination of parameters represents a distinct model, resulting in a comprehensive exploration of the parameter space.
 
-- **Parameter Selection**: The expected value for positive cases (\(EV_{pos}\)) ranged between 0.51 and 0.80, and for negative cases (\(EV_{neg}\)) between 0.20 and 0.49.
+- **Parameter Selection**: The expected value for positive cases (EV Positive) ranged between 0.51 and 0.80, and negative cases (EV Negative) between 0.20 and 0.49.
 - **Prevalence Levels - Minority/Majority Group (A/B)**: Prevalence levels for subgroups A/B were simulated at 0.05, 0.20, 0.35, and 0.50.
 - **Attribute Ratio**: The attribute ratio, reflecting the relative size of subgroup A within the dataset, was varied at 5\%, 15\%, and 25\%.
 - **Confidence Parameters**: The beta parameter was simulated at three levels of confidence: 0.10, 2.05, and 4.00.
