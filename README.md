@@ -29,7 +29,7 @@ To simulate risk scores between 0 and 1, the beta distribution was used due to i
 - **measure-sensitivity**: Contains the analysis and plots provided for the sensitivity of AUPRC and AUROC to subpopulation shifts.
 - **decision-curve-analysis**: Contains code to reproduce the analysis for downstream utility effects of choosing AUPRC versus AUROC in deployment settings.
 - **expected-cost-analysis**: Contains code for the expected cost analysis, which is not included in the thesis but follows the same process as the decision-curve analysis.
-- **figures-simulation**: Contains figures from the simulation analysis.
+- **simulation-figures**: Contains figures from the simulation analysis.
 
 ## GOSSIS Analysis
 
